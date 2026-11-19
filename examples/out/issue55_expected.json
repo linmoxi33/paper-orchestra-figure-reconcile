@@ -1,0 +1,60 @@
+{
+  "ok": false,
+  "strict": false,
+  "run_dir": "<repo>/examples/in/issue55_run",
+  "tex_files": [
+    "latex_writeup/paper.tex"
+  ],
+  "figures_dir": "latex_writeup/figures",
+  "provided_dir": "raw_materials/figures",
+  "provided": [
+    "raw_materials/figures/fig1_panel.pdf",
+    "raw_materials/figures/fig2_brechas.pdf"
+  ],
+  "includes": [
+    {
+      "file": "latex_writeup/paper.tex",
+      "line": 7,
+      "target": "figures/fig1_panel.pdf",
+      "resolved": "latex_writeup/figures/fig1_panel.pdf"
+    },
+    {
+      "file": "latex_writeup/paper.tex",
+      "line": 13,
+      "target": "figures/fig_evaluation_panel_map.pdf",
+      "resolved": null
+    }
+  ],
+  "info_json": "latex_writeup/figures/info.json",
+  "info_entries": 0,
+  "counts": {
+    "provided": 2,
+    "includes": 2,
+    "resolved": 1,
+    "dangling": 1,
+    "unreferenced": 1,
+    "errors": 3,
+    "warnings": 0
+  },
+  "findings": [
+    {
+      "code": "dangling-include",
+      "severity": "error",
+      "file": "examples/in/issue55_run/latex_writeup/paper.tex",
+      "line": 13,
+      "detail": "\\includegraphics refers to 'figures/fig_evaluation_panel_map.pdf' but no such image exists"
+    },
+    {
+      "code": "provided-unreferenced",
+      "severity": "error",
+      "file": "examples/in/issue55_run/raw_materials/figures/fig2_brechas.pdf",
+      "detail": "provided figure 'fig2_brechas.pdf' is never included by the generated LaTeX"
+    },
+    {
+      "code": "info-json-missing",
+      "severity": "error",
+      "file": "examples/in/issue55_run/latex_writeup/figures/info.json",
+      "detail": "2 provided figure(s) but figures/info.json has no entries; the section writer receives 'No figures provided.'"
+    }
+  ]
+}

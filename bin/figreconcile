@@ -1,0 +1,568 @@
+#!/usr/bin/env python3
+"""figreconcile - offline figure provenance checker for PaperOrchestra run dirs.
+
+It compares the figures a run was given (raw_materials/figures/) with the
+figures its generated LaTeX actually includes (\\includegraphics), and with the
+figures/info.json inventory the section-writing agent reads.
+
+No network, no third-party packages.
+"""
+import argparse
+import json
+import os
+import re
+import sys
+from typing import Dict, List, Optional, Tuple
+
+VERSION = "1.0.0"
+IMAGE_EXTS = (".pdf", ".png", ".jpg", ".jpeg", ".eps", ".svg")
+INCLUDE_RE = re.compile(
+    r"\\includegraphics\s*(?:\[[^\]]*\])?\s*\{(?P<path>[^}]*)\}", re.S
+)
+
+
+class UsageError(Exception):
+    pass
+
+
+def natural_key(text: str):
+    return [int(p) if p.isdigit() else p.lower() for p in re.split(r"(\d+)", text)]
+
+
+def is_image(name: str) -> bool:
+    return name.lower().endswith(IMAGE_EXTS)
+
+
+def walk_files(root: str) -> List[str]:
+    out = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = sorted(d for d in dirnames if d not in (".git", "__pycache__"))
+        for fn in sorted(filenames):
+            out.append(os.path.join(dirpath, fn))
+    return out
+
+
+def find_tex_files(run_dir: str) -> List[str]:
+    tex = [p for p in walk_files(run_dir) if p.lower().endswith(".tex")]
+    # Prefer the generated writeup over template copies if both are present.
+    writeup = [p for p in tex if os.sep + "latex_writeup" + os.sep in p]
+    candidates = writeup or tex
+    return [p for p in candidates if "\\documentclass" in read_text(p)]
+
+
+def read_text(path: str) -> str:
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            return fh.read()
+    except OSError:
+        return ""
+
+
+def find_dir(run_dir: str, *names: str) -> Optional[str]:
+    direct = os.path.join(run_dir, *names)
+    if os.path.isdir(direct):
+        return direct
+    for path in walk_files(run_dir):
+        rel = os.path.relpath(os.path.dirname(path), run_dir)
+        parts = rel.split(os.sep)
+        if len(parts) >= len(names) and parts[-len(names):] == list(names):
+            return os.path.dirname(path)
+    return None
+
+
+def discover_layout(run_dir: str) -> Dict[str, object]:
+    if not os.path.isdir(run_dir):
+        raise UsageError("run directory does not exist: %s" % run_dir)
+    tex_files = find_tex_files(run_dir)
+    if not tex_files:
+        raise UsageError("no LaTeX file with \\documentclass found under: %s" % run_dir)
+    provided_dir = find_dir(run_dir, "raw_materials", "figures") or find_dir(
+        run_dir, "figures"
+    )
+    latex_dir = find_dir(run_dir, "latex_writeup")
+    latex_figures = None
+    if latex_dir:
+        guess = os.path.join(latex_dir, "figures")
+        latex_figures = guess if os.path.isdir(guess) else None
+    return {
+        "tex_files": tex_files,
+        "provided_dir": provided_dir,
+        "latex_dir": latex_dir,
+        "latex_figures": latex_figures,
+    }
+
+
+def collect_includes(tex_files: List[str]) -> List[Dict[str, object]]:
+    found = []
+    for tex in tex_files:
+        text = read_text(tex)
+        for match in INCLUDE_RE.finditer(text):
+            raw = match.group("path").strip()
+            line = text.count("\n", 0, match.start()) + 1
+            found.append({"file": tex, "line": line, "target": raw})
+    return found
+
+
+def candidate_paths(target: str, tex_file: str, run_dir: str) -> List[str]:
+    bases = [os.path.dirname(tex_file), run_dir]
+    out = []
+    for base in bases:
+        base_path = os.path.normpath(os.path.join(base, target))
+        out.append(base_path)
+        if not os.path.splitext(target)[1]:
+            for ext in IMAGE_EXTS:
+                out.append(base_path + ext)
+    return out
+
+
+def resolve_targets(includes, run_dir, latex_figures) -> List[Dict[str, object]]:
+    results = []
+    for inc in includes:
+        resolved = None
+        for cand in candidate_paths(inc["target"], inc["file"], run_dir):
+            if os.path.isfile(cand):
+                resolved = cand
+                break
+        if resolved is None and latex_figures:
+            base = os.path.basename(inc["target"])
+            for name in os.listdir(latex_figures):
+                stem, ext = os.path.splitext(name)
+                if base in (name, stem) or inc["target"] in (name, stem):
+                    resolved = os.path.join(latex_figures, name)
+                    break
+        item = dict(inc)
+        item["resolved"] = resolved
+        results.append(item)
+    return results
+
+
+def collect_images(directory: Optional[str]) -> List[str]:
+    if not directory or not os.path.isdir(directory):
+        return []
+    return sorted(
+        (p for p in walk_files(directory) if is_image(p)),
+        key=lambda p: natural_key(os.path.relpath(p, directory)),
+    )
+
+
+def load_info(info_path: Optional[str]) -> Tuple[Optional[dict], object]:
+    if not info_path:
+        return None, None
+    if not os.path.isfile(info_path):
+        return info_path, None
+    try:
+        with open(info_path, "r", encoding="utf-8") as fh:
+            return info_path, json.load(fh)
+    except (OSError, json.JSONDecodeError):
+        return info_path, None
+
+
+def check(run_dir: str, strict: bool = False) -> Dict[str, object]:
+    layout = discover_layout(run_dir)
+    includes = collect_includes(layout["tex_files"])
+    resolved = resolve_targets(includes, run_dir, layout["latex_figures"])
+    provided = collect_images(layout["provided_dir"])
+    referenced = [i for i in resolved if i["resolved"]]
+    referenced_basenames = {os.path.basename(i["resolved"]) for i in referenced}
+    referenced_stems = {os.path.splitext(b)[0] for b in referenced_basenames}
+
+    findings: List[Dict[str, object]] = []
+    for inc in resolved:
+        if not inc["resolved"]:
+            findings.append(
+                {
+                    "code": "dangling-include",
+                    "severity": "error",
+                    "file": inc["file"],
+                    "line": inc["line"],
+                    "detail": "\\includegraphics refers to %r but no such image exists"
+                    % inc["target"],
+                }
+            )
+    for path in provided:
+        base = os.path.basename(path)
+        if base not in referenced_basenames and os.path.splitext(base)[0] not in referenced_stems:
+            findings.append(
+                {
+                    "code": "provided-unreferenced",
+                    "severity": "error",
+                    "file": path,
+                    "detail": "provided figure %r is never included by the generated LaTeX"
+                    % base,
+                }
+            )
+
+    info_candidates = []
+    if layout["latex_figures"]:
+        info_candidates.append(os.path.join(layout["latex_figures"], "info.json"))
+    if layout["provided_dir"]:
+        info_candidates.append(os.path.join(layout["provided_dir"], "info.json"))
+    info_path = next((p for p in info_candidates if os.path.isfile(p)), None)
+    if not info_path:
+        info_path = info_candidates[0] if info_candidates else None
+    info_path, info = load_info(info_path)
+    entries = info if isinstance(info, list) else []
+    if provided and not entries:
+        findings.append(
+            {
+                "code": "info-json-missing",
+                "severity": "error",
+                "file": info_path,
+                "detail": "%d provided figure(s) but figures/info.json has no entries; "
+                "the section writer receives 'No figures provided.'"
+                % len(provided),
+            }
+        )
+    known = set()
+    if layout["latex_figures"] and os.path.isdir(layout["latex_figures"]):
+        known |= set(os.listdir(layout["latex_figures"]))
+    if layout["provided_dir"] and os.path.isdir(layout["provided_dir"]):
+        known |= set(os.listdir(layout["provided_dir"]))
+    for idx, entry in enumerate(entries or [], 1):
+        if not isinstance(entry, dict):
+            findings.append(
+                {
+                    "code": "info-json-bad-entry",
+                    "severity": "warning",
+                    "file": info_path,
+                    "detail": "entry %d is not an object" % idx,
+                }
+            )
+            continue
+        name = str(entry.get("name", ""))
+        if name and known and name not in known:
+            findings.append(
+                {
+                    "code": "info-json-unknown-name",
+                    "severity": "warning",
+                    "file": info_path,
+                    "detail": "info.json entry %d names %r which is not in the figures directory"
+                    % (idx, name),
+                }
+            )
+        if not str(entry.get("caption", "")).strip():
+            findings.append(
+                {
+                    "code": "info-json-empty-caption",
+                    "severity": "warning",
+                    "file": info_path,
+                    "detail": "info.json entry %d (%s) has an empty caption" % (idx, name),
+                }
+            )
+
+    errors = sum(1 for f in findings if f["severity"] == "error")
+    warnings = sum(1 for f in findings if f["severity"] == "warning")
+    ok = errors == 0 and not (strict and warnings)
+    return {
+        "ok": ok,
+        "strict": strict,
+        "run_dir": os.path.abspath(run_dir),
+        "tex_files": [os.path.relpath(p, run_dir) for p in layout["tex_files"]],
+        "figures_dir": os.path.relpath(layout["latex_figures"], run_dir)
+        if layout["latex_figures"]
+        else None,
+        "provided_dir": os.path.relpath(layout["provided_dir"], run_dir)
+        if layout["provided_dir"]
+        else None,
+        "provided": [os.path.relpath(p, run_dir) for p in provided],
+        "includes": [
+            {
+                "file": os.path.relpath(i["file"], run_dir),
+                "line": i["line"],
+                "target": i["target"],
+                "resolved": os.path.relpath(i["resolved"], run_dir) if i["resolved"] else None,
+            }
+            for i in resolved
+        ],
+        "info_json": os.path.relpath(info_path, run_dir) if info_path else None,
+        "info_entries": len(entries),
+        "counts": {
+            "provided": len(provided),
+            "includes": len(resolved),
+            "resolved": len(referenced),
+            "dangling": sum(1 for f in findings if f["code"] == "dangling-include"),
+            "unreferenced": sum(1 for f in findings if f["code"] == "provided-unreferenced"),
+            "errors": errors,
+            "warnings": warnings,
+        },
+        "findings": findings,
+    }
+
+
+def captions_from_file(path: str) -> Dict[str, str]:
+    if not os.path.isfile(path):
+        raise UsageError("captions file does not exist: %s" % path)
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise UsageError("captions file is not valid JSON: %s" % exc)
+    mapping: Dict[str, str] = {}
+    if isinstance(data, dict):
+        if isinstance(data.get("figures"), list):
+            for entry in data["figures"]:
+                if isinstance(entry, dict) and entry.get("name"):
+                    mapping[str(entry["name"])] = str(entry.get("caption", ""))
+        else:
+            for key, value in data.items():
+                if isinstance(value, str):
+                    mapping[str(key)] = value
+                elif isinstance(value, dict) and "caption" in value:
+                    mapping[str(key)] = str(value["caption"])
+    elif isinstance(data, list):
+        for entry in data:
+            if isinstance(entry, dict) and entry.get("name"):
+                mapping[str(entry["name"])] = str(entry.get("caption", ""))
+    if not mapping:
+        raise UsageError("captions file has no usable name -> caption mapping")
+    return mapping
+
+
+def emit_info(run_dir: str, captions_path: Optional[str], out_path: Optional[str], force: bool) -> Dict[str, object]:
+    layout = discover_layout(run_dir)
+    provided = collect_images(layout["provided_dir"])
+    if not provided:
+        return {"ok": False, "reason": "no-provided-figures", "written": None, "entries": []}
+    captions: Dict[str, str] = {}
+    source = captions_path
+    if not source and layout["provided_dir"]:
+        sidecar = os.path.join(layout["provided_dir"], "captions.json")
+        if os.path.isfile(sidecar):
+            source = sidecar
+    if source:
+        captions = captions_from_file(source)
+    target = out_path
+    if not target:
+        base = layout["latex_figures"] or layout["provided_dir"]
+        target = os.path.join(base, "info.json")
+    if os.path.exists(target) and not force:
+        return {
+            "ok": False,
+            "reason": "exists (pass --force to overwrite)",
+            "written": target,
+            "entries": [],
+        }
+    entries = []
+    for path in provided:
+        name = os.path.basename(path)
+        caption = captions.get(name) or captions.get(os.path.splitext(name)[0]) or ""
+        entries.append(
+            {
+                "name": name,
+                "caption": caption if caption else "(caption not provided)",
+                "caption_source": "captions_file" if caption else "placeholder",
+            }
+        )
+    os.makedirs(os.path.dirname(target) or ".", exist_ok=True)
+    with open(target, "w", encoding="utf-8") as fh:
+        json.dump([{"name": e["name"], "caption": e["caption"]} for e in entries], fh, indent=4)
+        fh.write("\n")
+    return {
+        "ok": True,
+        "reason": "",
+        "written": target,
+        "figures": len(provided),
+        "captions_missing": sum(1 for e in entries if e["caption_source"] == "placeholder"),
+        "entries": entries,
+    }
+
+
+def cmd_check(args) -> int:
+    try:
+        result = check(args.run_dir, strict=args.strict)
+    except UsageError as exc:
+        print("figreconcile: error: %s" % exc, file=sys.stderr)
+        return 2
+    if args.json:
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+    else:
+        c = result["counts"]
+        print("run: %s" % result["run_dir"])
+        print(
+            "provided=%d includes=%d resolved=%d dangling=%d unreferenced=%d"
+            % (c["provided"], c["includes"], c["resolved"], c["dangling"], c["unreferenced"])
+        )
+        print("info.json: %s (%d entries)" % (result["info_json"], result["info_entries"]))
+        for f in result["findings"]:
+            loc = f.get("file") or ""
+            line = ":%s" % f["line"] if f.get("line") else ""
+            print("[%s] %s %s%s %s" % (f["severity"].upper(), f["code"], loc, line, f["detail"]))
+        print("OK" if result["ok"] else "FAILED")
+    return 0 if result["ok"] else 1
+
+
+def cmd_emit_info(args) -> int:
+    try:
+        result = emit_info(args.run_dir, args.captions, args.out, args.force)
+    except UsageError as exc:
+        print("figreconcile: error: %s" % exc, file=sys.stderr)
+        return 2
+    if args.json:
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+    else:
+        if result["ok"]:
+            print(
+                "wrote %s with %d entries (%d captions missing)"
+                % (result["written"], result["figures"], result["captions_missing"])
+            )
+        else:
+            print(
+                "not written: %s (%s)" % (result["written"], result["reason"]),
+                file=sys.stderr,
+            )
+    return 0 if result["ok"] else 1
+
+
+def load_mapping(path: Optional[str]) -> Dict[str, str]:
+    if not path:
+        raise UsageError("relink requires --map mapping.json")
+    if not os.path.isfile(path):
+        raise UsageError("mapping file does not exist: %s" % path)
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise UsageError("mapping file is not valid JSON: %s" % exc)
+    if not isinstance(data, dict) or not data:
+        raise UsageError("mapping file must be a non-empty JSON object")
+    clean = {}
+    for key, value in data.items():
+        if not isinstance(value, str) or not value.strip():
+            raise UsageError("mapping value for %r must be a non-empty string" % key)
+        clean[str(key)] = value.strip()
+    return clean
+
+
+def lookup_mapping(target: str, mapping: Dict[str, str]) -> Optional[str]:
+    for key in (target, os.path.basename(target), os.path.splitext(os.path.basename(target))[0]):
+        if key in mapping:
+            return mapping[key]
+    return None
+
+
+def relink(run_dir: str, mapping_path: Optional[str], write: bool) -> Dict[str, object]:
+    layout = discover_layout(run_dir)
+    mapping = load_mapping(mapping_path)
+    includes = resolve_targets(collect_includes(layout["tex_files"]), run_dir, layout["latex_figures"])
+    changes = []
+    by_file: Dict[str, List[Dict[str, object]]] = {}
+    for inc in includes:
+        if inc["resolved"]:
+            continue
+        replacement = lookup_mapping(inc["target"], mapping)
+        if not replacement:
+            changes.append(
+                {
+                    "file": os.path.relpath(inc["file"], run_dir),
+                    "line": inc["line"],
+                    "target": inc["target"],
+                    "replacement": None,
+                    "applied": False,
+                    "reason": "no mapping entry",
+                }
+            )
+            continue
+        exists = any(os.path.isfile(c) for c in candidate_paths(replacement, inc["file"], run_dir))
+        changes.append(
+            {
+                "file": os.path.relpath(inc["file"], run_dir),
+                "line": inc["line"],
+                "target": inc["target"],
+                "replacement": replacement,
+                "applied": bool(exists and write),
+                "reason": "" if exists else "replacement does not resolve to a file",
+            }
+        )
+        if exists:
+            by_file.setdefault(inc["file"], []).append(
+                {"start": None, "line": inc["line"], "target": inc["target"], "replacement": replacement}
+            )
+
+    # Re-derive match spans lazily so replacements cannot shift each other.
+    for tex, wanted in by_file.items():
+        text = read_text(tex)
+        matches = list(INCLUDE_RE.finditer(text))
+        edits = []
+        for match in matches:
+            target = match.group("path").strip()
+            chosen = next((w for w in wanted if w["target"] == target and w["start"] is None), None)
+            if chosen is None:
+                continue
+            chosen["start"] = match.start("path")
+            edits.append((match.start("path"), match.end("path"), chosen["replacement"]))
+        if write and edits:
+            for start, end, replacement in sorted(edits, reverse=True):
+                text = text[:start] + replacement + text[end:]
+            with open(tex, "w", encoding="utf-8") as fh:
+                fh.write(text)
+
+    unresolved = [c for c in changes if not c["replacement"] or not c["reason"] == ""]
+    applied = [c for c in changes if c["applied"]]
+    return {
+        "ok": not unresolved,
+        "write": write,
+        "run_dir": os.path.abspath(run_dir),
+        "mapped": len(changes) - len(unresolved),
+        "applied": len(applied),
+        "unresolved": len(unresolved),
+        "changes": changes,
+    }
+
+
+def cmd_relink(args) -> int:
+    try:
+        result = relink(args.run_dir, args.map, args.write)
+    except UsageError as exc:
+        print("figreconcile: error: %s" % exc, file=sys.stderr)
+        return 2
+    if args.json:
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+    else:
+        for c in result["changes"]:
+            state = "rewritten" if c["applied"] else ("dry-run" if c["replacement"] else "UNMAPPED")
+            print("%s:%s %s -> %s [%s] %s" % (
+                c["file"], c["line"], c["target"], c["replacement"], state, c["reason"]))
+        print("applied=%d unresolved=%d%s" % (
+            result["applied"], result["unresolved"], "" if result["write"] else " (dry-run, pass --write)"))
+    return 0 if result["ok"] else 1
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="figreconcile",
+        description="Offline figure provenance checker/reconciler for PaperOrchestra run dirs.",
+    )
+    p.add_argument("--version", action="version", version="figreconcile " + VERSION)
+    sub = p.add_subparsers(dest="command")
+    c = sub.add_parser("check", help="compare provided figures with generated LaTeX includes")
+    c.add_argument("run_dir")
+    c.add_argument("--json", action="store_true")
+    c.add_argument("--strict", action="store_true", help="warnings also fail the run")
+    c.set_defaults(func=cmd_check)
+    e = sub.add_parser("emit-info", help="build figures/info.json from the provided figures")
+    e.add_argument("run_dir")
+    e.add_argument("--captions", help="JSON mapping filename -> caption")
+    e.add_argument("--out", help="output path (default: <latex_writeup>/figures/info.json)")
+    e.add_argument("--force", action="store_true")
+    e.add_argument("--json", action="store_true")
+    e.set_defaults(func=cmd_emit_info)
+    r = sub.add_parser("relink", help="rewrite dangling \\includegraphics targets from an explicit mapping")
+    r.add_argument("run_dir")
+    r.add_argument("--map", help="JSON object: dangling target -> real file")
+    r.add_argument("--write", action="store_true", help="actually rewrite the .tex files")
+    r.add_argument("--json", action="store_true")
+    r.set_defaults(func=cmd_relink)
+    return p
+
+
+def main(argv=None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if not getattr(args, "func", None):
+        parser.print_help(sys.stderr)
+        return 2
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
