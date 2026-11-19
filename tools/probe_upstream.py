@@ -64,13 +64,19 @@ def main():
     with open(os.path.join(latex, "paper.tex"), "w", encoding="utf-8") as fh:
         fh.write("\\documentclass{article}\\begin{document}x\\end{document}\n")
     name = demo["figure_path"]
-    with open(os.path.join(raw_figs, name), "wb") as fh:
-        fh.write(open(os.path.join(upstream, "frontend", "examples", name), "rb").read())
+    source = os.path.join(upstream, "frontend", "examples", name)
+    for target in (raw_figs, figs):
+        with open(os.path.join(target, name), "wb") as fh:
+            fh.write(open(source, "rb").read())
 
     agent = SectionWritingAgent(
         "o", "t", "i", "e", "c", os.path.join(figs, "info.json"), "g"
     )
-    before_entries = agent._read_json(agent.figures_info_path)
+    fallback_available = hasattr(agent, "_load_figures_info")
+    if fallback_available:
+        before_entries = agent._load_figures_info()
+    else:
+        before_entries = agent._read_json(agent.figures_info_path)
     before_text = agent._format_figures_context(before_entries)
 
     proc = subprocess.run(
@@ -92,10 +98,16 @@ def main():
         "after_mentions_real_filename": name in after_text,
         "emit_exit": proc.returncode,
         "emit_captions_missing": emitted.get("captions_missing"),
-        "verdict": "confirmed"
-        if before_text == "No figures provided." and name in after_text
-        else "not-confirmed",
+        "fallback_available": fallback_available,
     }
+    if fallback_available:
+        result["verdict"] = "already-fixed" if name in before_text else "not-confirmed"
+    else:
+        result["verdict"] = (
+            "confirmed"
+            if before_text == "No figures provided." and name in after_text
+            else "not-confirmed"
+        )
     if args.json:
         print(json.dumps(result, indent=2))
     else:
@@ -104,7 +116,7 @@ def main():
         print("after : %d chars, real filename present: %s" % (
             result["after_chars"], result["after_mentions_real_filename"]))
         print("verdict:", result["verdict"])
-    return 0 if result["verdict"] == "confirmed" else 1
+    return 0 if result["verdict"] in ("confirmed", "already-fixed") else 1
 
 
 if __name__ == "__main__":

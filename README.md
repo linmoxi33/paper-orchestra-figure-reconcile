@@ -11,6 +11,7 @@ PaperOrchestra (Google Research, 4.4k stars, pushed 2026-11-15) generates a LaTe
 - [issue #55](https://github.com/google-research/paper-orchestra/issues/55) — open, 2026-11-18, "Provided figures are silently missing from the output PDF when running without --use_plotting"
 - [issue #53](https://github.com/google-research/paper-orchestra/issues/53) — same report, closed as duplicate
 - [issue #23](https://github.com/google-research/paper-orchestra/issues/23) — open, Streamlit demo never writes `figures/info.json`, so uploaded figures are dropped
+- [PR #56](https://github.com/google-research/paper-orchestra/pull/56) — a writer-side fix is proposed but still unmerged; `main` at `d9bae997e793` keeps the bug
 
 `figreconcile` is not a reimplementation of the pipeline. It reads the artifacts a run already produced and answers one question deterministically: **does every figure the run was given appear in the LaTeX, and does every `\includegraphics` point at a file that exists?**
 
@@ -43,6 +44,8 @@ before: 'No figures provided.' (20 chars)
 after : 160 chars, real filename present: True
 verdict: confirmed
 ```
+
+A minimal directory-listing fallback in `_load_figures_info()` raises the same probe to 138 chars (real filename, empty caption) without needing any inventory; `emit-info` reaches 160 chars because it carries the caption too.
 
 The same fixture with `figreconcile check` reports three errors: 1 dangling include, 1 supplied-but-unreferenced figure, 1 missing inventory — see `examples/out/issue55_expected.json`. This reproduces the issue's mechanism at the function boundary; it is not an end-to-end LLM run.
 
@@ -112,7 +115,7 @@ Reports so far are one-off anecdotes; this is the first check that turns PaperOr
 
 ## 与同类项目的差异
 
-`gh search repos "latex figure includegraphics validator"` returns no project doing figure-provenance reconciliation (see `/tmp/similar.md` at build time). LaTeX linters such as `chktex` check syntax, not whether the files a run was given reached the manuscript; PaperOrchestra's own `autoraters/` score prose and citations, not figure presence.
+`gh search repos "latex figure includegraphics validator"` returns no project doing figure-provenance reconciliation (see `/tmp/similar.md` at build time). The upstream already has unmerged [PR #56](https://github.com/google-research/paper-orchestra/pull/56) (writer-side inventory) and [#24](https://github.com/google-research/paper-orchestra/pull/24) (demo-side inventory); this project is the independent checker/repair path that does not depend on either landing. LaTeX linters such as `chktex` check syntax, not whether the files a run was given reached the manuscript; PaperOrchestra's own `autoraters/` score prose and citations, not figure presence.
 
 ## Limits
 
